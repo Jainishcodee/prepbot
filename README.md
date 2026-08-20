@@ -100,6 +100,12 @@ copy .env.example .env          # then paste a free key from
 
 Then open <http://127.0.0.1:8000>. API docs at `/docs`.
 
+### Adding your own notes
+
+Ingestion reads `data/**/*.md`, so drop any markdown in `data/` and re-run
+`scripts.ingest`. Anything under **`data/private/`** is indexed exactly the same way but
+is gitignored — that is where personal notes go, so a public repo never carries them.
+
 ```bash
 .venv\Scripts\python.exe -m pytest -q
 ```
@@ -116,7 +122,7 @@ logic, which is what actually determines whether retrieval works.
 | `app/embeddings.py` | Gemini embeddings and generation; the only file that talks to an API |
 | `app/rag.py` | Retrieve → relevance gate → prompt construction → answer |
 | `app/main.py` | FastAPI routes and the chat UI |
-| `scripts/ingest.py` | Build the index from `data/*.md` |
+| `scripts/ingest.py` | Build the index from `data/**/*.md` |
 | `scripts/check_setup.py` | Verify the key and model names before a full ingest |
 
 ## Known limits
