@@ -12,16 +12,22 @@ vectors that match each other better. Hence `RETRIEVAL_DOCUMENT` at ingest time 
 """
 
 import os
+import re
+import time
 
 import numpy as np
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-004")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-2.0-flash")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "gemini-embedding-001")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.6-flash")
 
 # The embedding endpoint caps how many texts it will take per call.
-BATCH_SIZE = 64
+BATCH_SIZE = 32
+
+# Seconds to pause between batches. The free tier meters embed calls per minute, so a
+# short pause keeps a large ingest under the cap instead of triggering a retry storm.
+PACE_SECONDS = float(os.getenv("EMBED_PACE_SECONDS", "25"))
 
 _client: genai.Client | None = None
 
@@ -44,17 +50,48 @@ def client() -> genai.Client:
     return _client
 
 
+def _embed_batch(batch: list[str], task_type: str, max_attempts: int = 6):
+    """Embed one batch, backing off when the free tier rate-limits us.
+
+    The free tier allows a fixed number of embed requests per minute. A 429 here is not a
+    failure, it is the server asking us to slow down — so we wait and retry rather than
+    dropping the batch. The API tells us how long to wait; we honour that when it is
+    present and fall back to exponential backoff when it is not.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client().models.embed_content(
+                model=EMBED_MODEL,
+                contents=batch,
+                config=types.EmbedContentConfig(task_type=task_type),
+            )
+            return [e.values for e in response.embeddings]
+        except errors.ClientError as exc:
+            if getattr(exc, "code", None) != 429 or attempt == max_attempts:
+                raise
+            delay = _retry_after(exc) or min(2 ** attempt, 60)
+            print(f"    rate limited, waiting {delay:.0f}s (attempt {attempt})", flush=True)
+            time.sleep(delay)
+    raise RuntimeError("unreachable")
+
+
+def _retry_after(exc) -> float | None:
+    """Pull the server's suggested retry delay out of a 429, if it gave one."""
+    match = re.search(r"[Pp]lease retry in ([\d.]+)s", str(exc))
+    if match:
+        return float(match.group(1)) + 1.0
+    return None
+
+
 def _embed(texts: list[str], task_type: str) -> np.ndarray:
     vectors: list[list[float]] = []
 
     for start in range(0, len(texts), BATCH_SIZE):
         batch = texts[start : start + BATCH_SIZE]
-        response = client().models.embed_content(
-            model=EMBED_MODEL,
-            contents=batch,
-            config=types.EmbedContentConfig(task_type=task_type),
-        )
-        vectors.extend(e.values for e in response.embeddings)
+        vectors.extend(_embed_batch(batch, task_type))
+        # Pace ourselves so we approach the per-minute cap instead of slamming into it.
+        if start + BATCH_SIZE < len(texts):
+            time.sleep(PACE_SECONDS)
 
     return np.array(vectors, dtype=np.float32)
 
